@@ -127,7 +127,7 @@ public var config = new{
     stopwatch = System.DateTime.UtcNow,
     perRegionJobs = new List<Job>{    
         //new("Densify","scripts/densify.gh"),
-        new("CoastMask","scripts/generateCoast.gh"),        
+        new("CoastMask","scripts/edge types.gh"),        
     }
 };
 
@@ -190,29 +190,68 @@ regions
 
 #!csharp
 
-await speckle.BranchCreate(new BranchCreateInput())
+public List<ShoreRegion> objs = new List<ShoreRegion>();
+
+static IEnumerable<Base> TryGetList(this Base @base, string str){
+    var child = @base[str];
+
+    var baseList = (child as IEnumerable<object>)        
+        .Select(x => x as Base);
+    
+    return baseList;
+}
+
+public record ShoreRegion(Region Region, string Name, string Id);
+
+foreach(var r in regions)
+{
+        
+        var branch = await speckle.BranchGet(root,$"{r.Name}/coastmask");
+
+        if(branch.commits is null) continue;
+        if(branch.commits.items.Count == 0) continue;
+
+        //objs.Add(branch.commits.items.First().);
+
+        //continue;
+
+        var @base = await Operations.Receive(branch.commits.items.First().referencedObject);
+
+        var regions = @base
+        .TryGetGhList("@data")
+        .First()
+        .TryGetList("@Coastlines")
+        .Cast<Base>()
+        .Select((obj,i) => new ShoreRegion(r,$"{r.Name}-{i}",obj.id));
+
+        objs.AddRange(regions);
+}
+
+objs
 
 #!csharp
 
-using Speckle.Core;
-using Speckle.Core.Api;
-using Speckle.Core.Credentials;
+var commits = new List<string>();
 
-public record RegionJob(Region Region, Job Job);
+public var branches = new List<Branch>();
+
 public record Log(string Message);
 
 public var report = new List<Log>();
 
-public var RegionJobs = regions.SelectMany(region =>
-    config.perRegionJobs.Select(job =>
-        new RegionJob(region, job)))
-    .ToList();
+foreach(var shoreRegion in objs.Take(4)){
 
-foreach(var rj in RegionJobs)
-{
-        var branchName = $"{rj.Region.Name}/{rj.Job.name}";
-        
-        var branch = await speckle.BranchGet(root,branchName).ContinueWith(x => x.Result is not null ? x.Result : null);
+    var branchName = $"{shoreRegion.Region.Name}/refinedShore/{shoreRegion.Name}";
+
+    var baseCall = $"{speckle.Account.serverInfo.url}/streams/{root}";
+    
+
+    var regionObjectPath = $"{baseCall}/objects/{shoreRegion.Id}";
+    var outBranch = $"{baseCall}/branches/{branchName}";
+    
+    var jobPath = System.IO.Path.GetFullPath(config.perRegionJobs[0].ghFileName);
+
+    var branch = await speckle.BranchGet(root,branchName).ContinueWith(x => x.Result is not null ? x.Result : null);
 
         if(branch is null){
 
@@ -228,38 +267,25 @@ foreach(var rj in RegionJobs)
             report.Add(new($"Created branch {branch.name}"));
         }else{
             report.Add(new($"Found branch {branch.name}"));
-        }    
-}
-
-report
-
-#!csharp
-
-var commits = new List<string>();
-
-public var branches = new List<Branch>();
-
-foreach(var rj in RegionJobs){
-    var (r,j) = rj;
-
-    var baseCall = $"{speckle.Account.serverInfo.url}/streams/{r.Stream}";
-
-    var regionObjectPath = $"{baseCall}/objects/{r.ObjectRef}";
-    var outBranch = $"{baseCall}/branches/{r.Name}/{j.name}";
-    var jobPath = System.IO.Path.GetFullPath(j.ghFileName);
+        } 
 
     var ghScript = Convert.ToBase64String(System.IO.File.ReadAllBytes(jobPath));
 
     var job = new ComputeJob(regionObjectPath,outBranch,ghScript);
     
-    RunJobOnCompute(job);   
+    //RunJobOnCompute(job);   
 
-    var branch = await speckle.BranchGet(r.Stream,$"{r.Name}/{j.name}",1);//.ContinueWith(x => x.Result.commits?.items[0].id ?? "");
+    branch = await speckle.BranchGet(root,branchName,1);//.ContinueWith(x => x.Result.commits?.items[0].id ?? "");
     branches.Add(branch);
 }
 
 branches
 
-//public var commit =$"{speckle.Account.serverInfo.url}/streams/{root}/commits/{commits.First()}?overlay={string.Join(',',commits.Skip(1).ToList())}";
+#!csharp
 
-//$"View the combined commit at '{commit}'"
+public var commit =$"{speckle.Account.serverInfo.url}/streams/{root}/commits/{branches.First().commits.items.First().id}?overlay={string.Join(',',branches
+    .Skip(1)
+    .Where(x => x.commits.items.Count != 0)
+    .Select(x => x.commits.items.First().id).ToList())}";
+
+$"View the combined commit at '{commit}'"
