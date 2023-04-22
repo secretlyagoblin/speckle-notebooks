@@ -1,0 +1,261 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"aliases":[],"name":"csharp"},{"aliases":[],"languageName":"fsharp","name":"fsharp"}]}}
+
+#!markdown
+
+# Speckle Job Runner
+
+#!markdown
+
+## Initiate
+
+#!markdown
+
+### Speckle
+
+#!csharp
+
+#r "nuget: Speckle.Core"
+
+#!csharp
+
+using Speckle.Core;
+using Speckle.Core.Api;
+using Speckle.Core.Credentials;
+
+//in case we want to do some stuff in parallel later
+static Client GetClient(){    
+    var account = Speckle.Core.Credentials.AccountManager.GetAccounts().First();
+    var client = new Client(account);
+    Speckle.Core.Logging.Setup.Init("2.13","Workbook");
+    return client;
+}
+
+public var speckle = GetClient();
+
+$"Logged into Speckle at url '{speckle.ServerUrl}' as '{speckle.Account.userInfo.name}' ({speckle.Account.userInfo.email})"
+
+#!markdown
+
+### Rhino
+
+#!csharp
+
+public var rhino = new System.Net.Http.HttpClient(){
+    BaseAddress = new Uri("http://localhost:5000")
+};
+
+if(rhino.GetStringAsync("/").Result != "compute.rhino3d") throw new Exception();
+
+$"Successfully connected to RhinoCompute at url '{rhino.BaseAddress}'"
+
+#!csharp
+
+#r "nuget: System.Net.Http.Json"
+
+using System.Net.Http.Json;
+using System.Text.Json;
+
+public record ComputeJob(string StreamIn, string StreamOut, string Algo);
+
+public void RunJobOnCompute(ComputeJob job)
+{
+    const string POINTER = null;
+
+    var schema = new
+    {
+        absolutetolerance = 0.01,
+        angletolerance = 1.0,
+        modelunits = "Meters",
+        algo = job.Algo,
+        pointer = POINTER,
+        cachesolve = false,
+        recursionlevel = 0,
+        values = new[] {
+          new {
+            ParamName = "SpeckleIn",
+              InnerTree = new Dictionary < string, object[] > {
+                {
+                  "0",
+                  new [] {
+                    new {
+                      type = "System.String",
+                      data = $"\"{job.StreamIn}\""
+                    },
+                  }
+                }
+              }
+          },
+          new {
+            ParamName = "SpeckleOut",
+              InnerTree = new Dictionary < string, object[] > {
+                {
+                  "0",
+                  new [] {
+                    new {
+                      type = "System.String",
+                      data = $"\"{job.StreamOut}\""
+                    }
+                  }
+                }
+              }
+          }
+        },
+        warnings = Array.Empty<object>(),
+        errors = Array.Empty<object>()
+    };
+
+    var script = rhino.PostAsJsonAsync("/grasshopper", schema).Result.Content.ReadFromJsonAsync<JsonElement>().Result;
+
+}
+
+#!markdown
+
+## Settings
+
+#!markdown
+
+### Config
+
+#!csharp
+
+public record Job(string name, string ghFileName);
+
+public var config = new{
+    root = "Root",
+    stopwatch = System.DateTime.UtcNow,
+    perRegionJobs = new List<Job>{    
+        //new("Densify","scripts/densify.gh"),
+        new("CoastMask","scripts/generateCoast.gh"),        
+    }
+};
+
+#!markdown
+
+#### Audit
+
+#!markdown
+
+## Jobs
+
+#!markdown
+
+### Configure Regions
+
+#!csharp
+
+//Iterate over Root
+using Speckle.Core.Models;
+
+
+static Base TryGetChild(this Base @base, string str){
+    if(@base[str] is not Base child) return null;
+    return child;
+}
+
+static string TryGetString(this Base @base, string str){
+    if(@base[str] is not string outStr) return null;
+    return outStr;
+}
+
+
+static IEnumerable<Base> TryGetGhList(this Base @base, string str){
+    var child = @base.TryGetChild(str);
+    var list = child?
+    .GetMembers()
+    .Where(x => x.Key.StartsWith(@"@{"))
+    .FirstOrDefault();
+
+    var baseList = (list?.Value as IEnumerable<object>)        
+        .Select(x => x as Base);
+    
+    return baseList;
+}
+
+public var root = await speckle.StreamSearch(config.root).ContinueWith(x => x.Result.First().id);
+var latest = await speckle.BranchGet(root,"Main").ContinueWith(x => x.Result.commits.items.First());
+
+var @base = await Operations.Receive(latest.referencedObject);
+
+public record Region(string Name, string Stream, string ObjectRef);
+
+public var regions = @base.TryGetGhList("@Regions")?.Select(x => new Region(x.TryGetString("regionId"),root,x.id));
+
+regions
+
+#!markdown
+
+### Run Region Job 1
+
+#!csharp
+
+using Speckle.Core;
+using Speckle.Core.Api;
+using Speckle.Core.Credentials;
+
+public record RegionJob(Region Region, Job Job);
+public record Log(string Message);
+
+public var report = new List<Log>();
+
+public var RegionJobs = regions.SelectMany(region =>
+    config.perRegionJobs.Select(job =>
+        new RegionJob(region, job)))
+    .ToList();
+
+foreach(var rj in RegionJobs)
+{
+        var branchName = $"{rj.Region.Name}/{rj.Job.name}";
+        
+        var branch = await speckle.BranchGet(root,branchName).ContinueWith(x => x.Result is not null ? x.Result : null);
+
+        if(branch is null){
+
+            var branchCreateInput = new BranchCreateInput(){
+                streamId = root,
+                description = "Test",
+                name = branchName
+            };
+
+            var res = await speckle.BranchCreate(branchCreateInput);
+            branch = await speckle.BranchGet(root,branchName);
+
+            report.Add(new($"Created branch {branch.name}"));
+        }else{
+            report.Add(new($"Found branch {branch.name}"));
+        }    
+}
+
+report
+
+#!csharp
+
+var commits = new List<string>();
+
+public var branches = new List<Branch>();
+
+foreach(var rj in RegionJobs){
+    var (r,j) = rj;
+
+    var baseCall = $"{speckle.Account.serverInfo.url}/streams/{r.Stream}";
+
+    var regionObjectPath = $"{baseCall}/objects/{r.ObjectRef}";
+    var outBranch = $"{baseCall}/branches/{r.Name}/{j.name}";
+    var jobPath = System.IO.Path.GetFullPath(j.ghFileName);
+
+    var ghScript = Convert.ToBase64String(System.IO.File.ReadAllBytes(jobPath));
+
+    var job = new ComputeJob(regionObjectPath,outBranch,ghScript);
+    
+    RunJobOnCompute(job);   
+
+    var branch = await speckle.BranchGet(r.Stream,$"{r.Name}/{j.name}",1);//.ContinueWith(x => x.Result.commits?.items[0].id ?? "");
+    branches.Add(branch);
+}
+
+branches
+
+//public var commit =$"{speckle.Account.serverInfo.url}/streams/{root}/commits/{commits.First()}?overlay={string.Join(',',commits.Skip(1).ToList())}";
+
+//$"View the combined commit at '{commit}'"
